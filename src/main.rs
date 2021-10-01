@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 
 use lazy_static::lazy_static;
 use libc::c_char;
@@ -16,11 +16,10 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-use ash::vk::{self, DebugUtilsMessengerCreateInfoEXTBuilder};
+use ash::vk::{self, DebugUtilsMessengerCreateInfoEXTBuilder, ValidationCacheCreateFlagsEXT};
 use ash::{extensions::ext::DebugUtils, vk::DebugUtilsMessengerCreateInfoEXT};
 //use ash::vk::{ApplicationInfo, StructureType};
 
-#[derive(Default)]
 struct VulkanApp {
     name: String,
     config: Config,
@@ -30,17 +29,30 @@ struct VulkanApp {
     enable_validation_layer: bool,
     debug_callback: Option<vk::DebugUtilsMessengerEXT>,
     debug_utils_loader: Option<DebugUtils>,
+    physical_device: Option<vk::PhysicalDevice>,
+    device: Option<ash::Device>,
+    graphics_queue: Option<vk::Queue>,
 }
 
 lazy_static! {
-    static ref KHRONOS_VALIDATION: &'static CStr =
-        CStr::from_bytes_with_nul("VK_LAYER_KHRONOS_validation\0".as_bytes()).unwrap();
+    static ref VALIDATION_LAYERS: [&'static CStr; 1] =
+        [CStr::from_bytes_with_nul("VK_LAYER_KHRONOS_validation\0".as_bytes()).unwrap()];
 }
 
 #[derive(Default)]
 struct Config {
     window_size: LogicalSize<u32>,
     resizable: bool,
+}
+
+struct QueueFamilyIndices {
+    graphics_family: Option<u32>,
+}
+
+impl QueueFamilyIndices {
+    fn is_complete(&self) -> bool {
+        self.graphics_family.is_some()
+    }
 }
 
 // copied from ash/examples/src/lib.rs
@@ -93,6 +105,9 @@ impl VulkanApp {
             enable_validation_layer: true, // if cfg!(debug_assertions) { true } else { false },
             debug_callback: None,
             debug_utils_loader: None,
+            device: None,
+            physical_device: None,
+            graphics_queue: None,
         };
         Ok(app)
     }
@@ -100,8 +115,7 @@ impl VulkanApp {
     pub fn run(mut self) -> Result<()> {
         let event_loop = self.init_window()?;
         self.init_vulkan()?;
-        //self.main_loop(event_loop)?;
-        debug!("cleanup");
+        self.main_loop(event_loop)?;
         Ok(())
     }
 
@@ -122,6 +136,10 @@ impl VulkanApp {
 
     fn init_vulkan(&mut self) -> Result<()> {
         self.create_instance()?;
+        self.setup_debug_messenger()?;
+        self.pick_physical_device()?;
+        self.create_logical_device()?;
+
         Ok(())
     }
 
@@ -165,22 +183,99 @@ impl VulkanApp {
 
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
 
-        self.setup_debug_messenger(&entry, &instance)?;
-
         self.entry = Some(entry);
         self.instance = Some(instance);
 
         Ok(())
     }
 
-    fn get_required_validation_layers(&self) -> Result<Vec<&'static CStr>> {
-        let mut validation_layers: Vec<&'static CStr> = vec![&KHRONOS_VALIDATION];
+    fn pick_physical_device(&mut self) -> Result<()> {
+        let instance = self.instance.as_ref().context("instance is None")?;
+        self.physical_device = unsafe {
+            instance
+                .enumerate_physical_devices()?
+                .into_iter()
+                .find(|&device| self.is_device_suitable(device).unwrap())
+        };
 
-        if self.enable_validation_layer {
-            validation_layers.push(&KHRONOS_VALIDATION);
+        if self.physical_device.is_none() {
+            anyhow::bail!("Failed to find suitable device")
         }
 
-        Ok(validation_layers)
+        Ok(())
+    }
+
+    fn create_logical_device(&mut self) -> Result<()> {
+        ensure!(self.physical_device.is_some());
+        let indices = self.find_queue_families(self.physical_device.unwrap())?;
+
+        let index = indices
+            .graphics_family
+            .context("Graphics queue family not supported")?;
+
+        let queue_create_info = [*vk::DeviceQueueCreateInfo::builder()
+            .queue_family_index(index)
+            .queue_priorities(&[1.0])];
+
+        let features = vk::PhysicalDeviceFeatures::builder();
+
+        let mut create_info = vk::DeviceCreateInfo::builder()
+            .queue_create_infos(&queue_create_info)
+            .enabled_features(&features);
+
+        let validation_layers = self.get_required_validation_layers()?;
+        let validation_layer_ptrs: Vec<*const c_char> =
+            validation_layers.iter().map(|l| l.as_ptr()).collect();
+        if self.enable_validation_layer {
+            create_info = create_info.enabled_layer_names(&validation_layer_ptrs);
+        }
+
+        let device = unsafe {
+            self.instance.as_ref().unwrap().create_device(
+                self.physical_device.unwrap(),
+                &create_info,
+                None,
+            )?
+        };
+
+        let graphics_queue = unsafe { device.get_device_queue(index, 0) };
+
+        self.device = Some(device);
+        self.graphics_queue = Some(graphics_queue);
+
+        Ok(())
+    }
+
+    unsafe fn is_device_suitable(&self, device: vk::PhysicalDevice) -> Result<bool> {
+        let indices = self.find_queue_families(device)?;
+
+        return Ok(indices.is_complete());
+    }
+
+    fn find_queue_families(&self, device: vk::PhysicalDevice) -> Result<QueueFamilyIndices> {
+        let instance = &self.instance.as_ref().context("instance is None")?;
+        let mut indices = QueueFamilyIndices {
+            graphics_family: None,
+        };
+
+        let families = unsafe { instance.get_physical_device_queue_family_properties(device) };
+        for (i, family) in families.iter().enumerate() {
+            if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                indices.graphics_family = Some(i as u32);
+            }
+        }
+
+        Ok(indices)
+    }
+
+    fn get_required_validation_layers(&self) -> Result<Vec<&'static CStr>> {
+        if self.enable_validation_layer {
+            //validation_layers.push(&KHRONOS_VALIDATION);
+            let mut validation_layers: Vec<&'static CStr> = VALIDATION_LAYERS.to_vec();
+            Ok(validation_layers)
+        } else {
+            Ok(vec![])
+        }
     }
 
     fn get_required_extension(&self) -> Result<Vec<&'static CStr>> {
@@ -263,11 +358,9 @@ impl VulkanApp {
             .pfn_user_callback(Some(vulkan_debug_callback)))
     }
 
-    fn setup_debug_messenger(
-        &mut self,
-        entry: &ash::Entry,
-        instance: &ash::Instance,
-    ) -> Result<()> {
+    fn setup_debug_messenger(&mut self) -> Result<()> {
+        let entry = self.entry.as_ref().context("entry is None")?;
+        let instance = self.instance.as_ref().context("instance is None")?;
         if !self.enable_validation_layer {
             return Ok(());
         }
@@ -308,6 +401,10 @@ impl Drop for VulkanApp {
                 (self.debug_utils_loader.take(), self.debug_callback.take())
             {
                 debug_utils_loader.destroy_debug_utils_messenger(debug_callback, None)
+            }
+
+            if let Some(device) = self.device.take() {
+                device.destroy_device(None);
             }
 
             if let Some(instance) = self.instance.take() {
