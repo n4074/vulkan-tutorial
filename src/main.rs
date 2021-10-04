@@ -16,8 +16,8 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+use ash::extensions::{ext::DebugUtils, khr::Surface as SurfaceLoader};
 use ash::vk::{self, DebugUtilsMessengerCreateInfoEXTBuilder};
-use ash::{extensions::ext::DebugUtils};
 //use ash::vk::{ApplicationInfo, StructureType};
 
 #[allow(dead_code)]
@@ -30,14 +30,16 @@ struct VulkanApp {
     physical_device: vk::PhysicalDevice,
     logical_device: ash::Device,
     graphics_queue: vk::Queue,
+    presentation_queue: vk::Queue,
     debug_callback: Option<vk::DebugUtilsMessengerEXT>,
     debug_utils_loader: Option<DebugUtils>,
+    surface: vk::SurfaceKHR,
+    surface_loader: SurfaceLoader,
 }
 
 lazy_static! {
     static ref VALIDATION_LAYERS: [&'static CStr; 1] =
         [CStr::from_bytes_with_nul("VK_LAYER_KHRONOS_validation\0".as_bytes()).unwrap()];
-
     static ref APP_NAME: CString = CString::new("Vulkan".as_bytes()).unwrap();
     static ref ENGINE_NAME: CString = CString::new("No engine".as_bytes()).unwrap();
 }
@@ -50,11 +52,12 @@ lazy_static! {
 
 struct QueueFamilyIndices {
     graphics_family: Option<u32>,
+    presentation_family: Option<u32>,
 }
 
 impl QueueFamilyIndices {
     fn is_complete(&self) -> bool {
-        self.graphics_family.is_some()
+        self.graphics_family.is_some() && self.presentation_family.is_some()
     }
 }
 
@@ -94,23 +97,24 @@ unsafe extern "system" fn vulkan_debug_callback(
 
 impl VulkanApp {
     pub fn new(name: &str, width: u32, height: u32) -> Result<Self> {
-
         let enable_validation_layer = true;
 
         let (window, event_loop) = Self::init_window(name, (width, height), true)?;
         let (entry, instance) = Self::create_instance(&window, enable_validation_layer)?;
+        let (surface, surface_loader) = Self::create_surface(&entry, &instance, &window)?;
 
         let mut debug_callback = None;
         let mut debug_utils_loader = None;
-        if let Some((debug_callback_, debug_utils_loader_)) = Self::setup_debug_messenger(&entry, &instance, enable_validation_layer)? {
+        if let Some((debug_callback_, debug_utils_loader_)) =
+            Self::setup_debug_messenger(&entry, &instance, enable_validation_layer)?
+        {
             debug_callback = Some(debug_callback_);
             debug_utils_loader = Some(debug_utils_loader_);
         };
 
-        let physical_device = Self::pick_physical_device(&instance)?;
-        let (logical_device, graphics_queue) = Self::create_logical_device(&instance, physical_device, enable_validation_layer)?;
-
-
+        let physical_device = Self::pick_physical_device(&instance, surface, &surface_loader)?;
+        let (logical_device, graphics_queue, presentation_queue) =
+            Self::create_logical_device(&instance, physical_device, surface, &surface_loader, enable_validation_layer)?;
 
         let app = VulkanApp {
             window,
@@ -122,6 +126,9 @@ impl VulkanApp {
             logical_device,
             physical_device,
             graphics_queue,
+            presentation_queue,
+            surface,
+            surface_loader,
         };
         Ok(app)
     }
@@ -145,8 +152,10 @@ impl VulkanApp {
         }
     }
 
-    fn create_instance(window: &Window, enable_validation_layer: bool) -> Result<(ash::Entry, ash::Instance)> {
-
+    fn create_instance(
+        window: &Window,
+        enable_validation_layer: bool,
+    ) -> Result<(ash::Entry, ash::Instance)> {
         let app_info = vk::ApplicationInfo::builder()
             .application_name(&APP_NAME)
             .application_version(vk::make_api_version(1, 0, 0, 0))
@@ -186,13 +195,13 @@ impl VulkanApp {
         Ok((entry, instance))
     }
 
-    fn pick_physical_device(instance: &ash::Instance) -> Result<vk::PhysicalDevice> {
+    fn pick_physical_device(instance: &ash::Instance, surface: vk::SurfaceKHR, surface_loader: &SurfaceLoader) -> Result<vk::PhysicalDevice> {
         let instance = instance;
         let physical_device = unsafe {
             instance
                 .enumerate_physical_devices()?
                 .into_iter()
-                .find(|&device| Self::is_device_suitable(instance, device).unwrap())
+                .find(|&device| Self::is_device_suitable(instance, device, surface, surface_loader).unwrap())
         };
 
         if let Some(physical_device) = physical_device {
@@ -202,16 +211,27 @@ impl VulkanApp {
         }
     }
 
-    fn create_logical_device(instance: &ash::Instance, physical_device: vk::PhysicalDevice, enable_validation_layer: bool) -> Result<(ash::Device, vk::Queue)> {
-        let indices = Self::find_queue_families(instance, physical_device)?;
+    fn create_logical_device(
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+        surface_loader: &SurfaceLoader,
+        enable_validation_layer: bool,
+    ) -> Result<(ash::Device, vk::Queue, vk::Queue)> {
+        let indices = Self::find_queue_families(instance, physical_device, surface, surface_loader)?;
 
-        let index = indices
-            .graphics_family
-            .context("Graphics queue family not supported")?;
+        if !indices.is_complete() {
+            anyhow::bail!("incomplete queue family support");
+        }
 
-        let queue_create_info = [*vk::DeviceQueueCreateInfo::builder()
-            .queue_family_index(index)
-            .queue_priorities(&[1.0])];
+        let queue_create_info = [
+            *vk::DeviceQueueCreateInfo::builder()
+                .queue_family_index(indices.graphics_family.unwrap())
+                .queue_priorities(&[1.0]),
+            *vk::DeviceQueueCreateInfo::builder()
+                .queue_family_index(indices.presentation_family.unwrap())
+                .queue_priorities(&[1.0]),
+        ];
 
         let features = vk::PhysicalDeviceFeatures::builder();
 
@@ -226,35 +246,56 @@ impl VulkanApp {
             create_info = create_info.enabled_layer_names(&validation_layer_ptrs);
         }
 
-        let device = unsafe {
-           instance.create_device(
-                physical_device,
-                &create_info,
-                None,
-            )?
-        };
+        let device = unsafe { instance.create_device(physical_device, &create_info, None)? };
 
-        let graphics_queue = unsafe { device.get_device_queue(index, 0) };
+        let graphics_queue = unsafe { device.get_device_queue(indices.graphics_family.unwrap(), 0) };
+        let presentation_queue = unsafe { device.get_device_queue(indices.presentation_family.unwrap(), 0) };
 
-        Ok((device, graphics_queue))
+        Ok((device, graphics_queue, presentation_queue))
     }
 
-    unsafe fn is_device_suitable(instance: &ash::Instance, device: vk::PhysicalDevice) -> Result<bool> {
-        let indices = Self::find_queue_families(instance, device)?;
+    fn create_surface(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        window: &Window,
+    ) -> Result<(vk::SurfaceKHR, SurfaceLoader)> {
+        let surface_loader = SurfaceLoader::new(entry, instance);
+        let surface = unsafe { ash_window::create_surface(entry, instance, window, None)? };
+        Ok((surface, surface_loader))
+    }
+
+    unsafe fn is_device_suitable(
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+        surface_loader: &SurfaceLoader,
+    ) -> Result<bool> {
+        let indices = Self::find_queue_families(instance, device, surface, surface_loader)?;
 
         return Ok(indices.is_complete());
     }
 
-    fn find_queue_families(instance: &ash::Instance, device: vk::PhysicalDevice) -> Result<QueueFamilyIndices> {
+    fn find_queue_families(
+        instance: &ash::Instance,
+        device: vk::PhysicalDevice,
+        surface: vk::SurfaceKHR,
+        surface_loader: &SurfaceLoader,
+    ) -> Result<QueueFamilyIndices> {
         let instance = instance;
         let mut indices = QueueFamilyIndices {
             graphics_family: None,
+            presentation_family: None,
         };
 
         let families = unsafe { instance.get_physical_device_queue_family_properties(device) };
-        for (i, family) in families.iter().enumerate() {
+        for (index, family) in families.iter().enumerate() {
             if family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                indices.graphics_family = Some(i as u32);
+                indices.graphics_family = Some(index as u32);
+            }
+
+            let supports_surface = unsafe { surface_loader.get_physical_device_surface_support(device, index as u32, surface)? };
+            if supports_surface {
+                indices.presentation_family = Some(index as u32);
             }
         }
 
@@ -269,9 +310,11 @@ impl VulkanApp {
         }
     }
 
-    fn get_required_extension(window: &Window, enable_validation_layer: bool) -> Result<Vec<&'static CStr>> {
-        let mut extensions =
-            ash_window::enumerate_required_extensions(window)?;
+    fn get_required_extension(
+        window: &Window,
+        enable_validation_layer: bool,
+    ) -> Result<Vec<&'static CStr>> {
+        let mut extensions = ash_window::enumerate_required_extensions(window)?;
 
         if enable_validation_layer {
             extensions.push(ash::extensions::ext::DebugUtils::name());
@@ -282,10 +325,7 @@ impl VulkanApp {
         Ok(extensions)
     }
 
-    fn check_extension_support(
-        entry: &ash::Entry,
-        required: &Vec<*const c_char>,
-    ) -> Result<()> {
+    fn check_extension_support(entry: &ash::Entry, required: &Vec<*const c_char>) -> Result<()> {
         let supported = entry.enumerate_instance_extension_properties()?;
 
         debug!("Supported extensions: {:?}", supported);
@@ -329,7 +369,8 @@ impl VulkanApp {
         Ok(())
     }
 
-    fn populate_debug_messenger_create_info<'b>() -> Result<DebugUtilsMessengerCreateInfoEXTBuilder<'b>> {
+    fn populate_debug_messenger_create_info<'b>(
+    ) -> Result<DebugUtilsMessengerCreateInfoEXTBuilder<'b>> {
         Ok(vk::DebugUtilsMessengerCreateInfoEXT::builder()
             .message_severity(
                 vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
@@ -345,7 +386,11 @@ impl VulkanApp {
             .pfn_user_callback(Some(vulkan_debug_callback)))
     }
 
-    fn setup_debug_messenger(entry: &ash::Entry, instance: &ash::Instance, enable_validation_layer: bool) -> Result<Option<(vk::DebugUtilsMessengerEXT, DebugUtils)>> {
+    fn setup_debug_messenger(
+        entry: &ash::Entry,
+        instance: &ash::Instance,
+        enable_validation_layer: bool,
+    ) -> Result<Option<(vk::DebugUtilsMessengerEXT, DebugUtils)>> {
         //let entry = self.entry.as_ref().context("entry is None")?;
         //let instance = self.instance.as_ref().context("instance is None")?;
         if !enable_validation_layer {
@@ -365,7 +410,11 @@ impl VulkanApp {
         Ok(Some((debug_callback, debug_utils_loader)))
     }
 
-    fn init_window(name: &str, window_size: (u32, u32), resizable: bool) -> Result<(Window, EventLoop<()>)> {
+    fn init_window(
+        name: &str,
+        window_size: (u32, u32),
+        resizable: bool,
+    ) -> Result<(Window, EventLoop<()>)> {
         let event_loop = EventLoop::new();
         let window = WindowBuilder::new()
             .with_title(name)
@@ -387,13 +436,11 @@ impl Drop for VulkanApp {
                 debug_utils_loader.destroy_debug_utils_messenger(debug_callback, None)
             }
 
-            //if let Some(device) = self.device.take() {
             self.logical_device.destroy_device(None);
-            //}
 
-            //if let Some(instance) = self.instance.take() {
+            self.surface_loader.destroy_surface(self.surface, None);
+
             self.instance.destroy_instance(None);
-            //}
         }
     }
 }
