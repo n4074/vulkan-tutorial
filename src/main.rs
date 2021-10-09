@@ -5,7 +5,6 @@ use libc::c_char;
 use std::{
     borrow::Cow,
     ffi::{CStr, CString},
-    mem::swap,
 };
 
 use log::debug;
@@ -23,7 +22,6 @@ use ash::{
         ext::DebugUtils,
         khr::{Surface, Swapchain},
     },
-    vk::SurfaceCapabilitiesKHR,
 };
 //use ash::vk::{ApplicationInfo, StructureType};
 
@@ -47,6 +45,7 @@ struct VulkanApp {
     swapchain_extent: vk::Extent2D,
     swapchain_format: vk::Format,
     swapchain_images: Vec<vk::Image>,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 
 lazy_static! {
@@ -140,8 +139,6 @@ impl VulkanApp {
         let (logical_device, graphics_queue, presentation_queue) = Self::create_logical_device(
             &instance,
             physical_device,
-            surface,
-            &surface_loader,
             enable_validation_layer,
             &queue_family_indices,
         )?;
@@ -157,6 +154,8 @@ impl VulkanApp {
         )?;
 
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
+
+        let swapchain_image_views = Self::create_image_views(&logical_device, &swapchain_images, swapchain_format)?;
 
         let app = VulkanApp {
             window,
@@ -175,7 +174,8 @@ impl VulkanApp {
             swapchain_images,
             swapchain_loader,
             swapchain_extent,
-            swapchain_format
+            swapchain_format,
+            swapchain_image_views,
         };
         Ok(app)
     }
@@ -190,7 +190,9 @@ impl VulkanApp {
                     Event::WindowEvent {
                         event: WindowEvent::CloseRequested,
                         window_id,
-                    } if window_id == id => *control_flow = ControlFlow::Exit,
+                    } => if window_id == id {
+                        *control_flow = ControlFlow::Exit
+                    },
                     _ => (),
                 }
             });
@@ -292,13 +294,40 @@ impl VulkanApp {
                 .queue_family_indices(&[]);
         }
 
-        let swapchain_loader = unsafe {
-            ash::extensions::khr::Swapchain::new(instance, device)
-        };
+        let swapchain_loader = ash::extensions::khr::Swapchain::new(instance, device);
 
         let swapchain = unsafe { swapchain_loader.create_swapchain(&create_info, None)? };
 
         Ok((swapchain, swapchain_loader, surface_format.format, extent))
+    }
+
+    fn create_image_views(device: &ash::Device, images: &Vec<vk::Image>, format: vk::Format) -> Result<Vec<vk::ImageView>> {
+        let mut image_views = vec![];
+        for image in images.iter() {
+            let create_info = vk::ImageViewCreateInfo::builder()
+                .image(*image)
+                .format(format)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .components(vk::ComponentMapping { 
+                    r: vk::ComponentSwizzle::IDENTITY,
+                    g: vk::ComponentSwizzle::IDENTITY,
+                    b: vk::ComponentSwizzle::IDENTITY,
+                    a: vk::ComponentSwizzle::IDENTITY 
+                })
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1
+                });
+
+            let view = unsafe { device.create_image_view(&create_info, None)? };
+
+            image_views.push(view);
+        }
+
+        Ok(image_views)
     }
 
     fn pick_physical_device(
@@ -326,8 +355,6 @@ impl VulkanApp {
     fn create_logical_device(
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
-        surface: vk::SurfaceKHR,
-        surface_loader: &Surface,
         enable_validation_layer: bool,
         indices: &QueueFamilyIndices,
     ) -> Result<(ash::Device, vk::Queue, vk::Queue)> {
@@ -654,6 +681,10 @@ impl Drop for VulkanApp {
                 (self.debug_utils_loader.take(), self.debug_callback.take())
             {
                 debug_utils_loader.destroy_debug_utils_messenger(debug_callback, None)
+            }
+
+            for image_view in self.swapchain_image_views.iter() {
+                self.logical_device.destroy_image_view(*image_view, None);
             }
 
             self.logical_device.destroy_device(None);
