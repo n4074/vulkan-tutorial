@@ -46,6 +46,7 @@ struct VulkanApp {
     swapchain_image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
 }
 
 lazy_static! {
@@ -162,7 +163,8 @@ impl VulkanApp {
             Self::create_image_views(&logical_device, &swapchain_images, swapchain_format)?;
 
         let render_pass = Self::create_render_pass(&logical_device, swapchain_format)?;
-        let pipeline_layout = Self::create_graphics_pipeline(&logical_device, swapchain_extent)?;
+        let (pipeline_layout, pipeline) =
+            Self::create_graphics_pipeline(&logical_device, render_pass, swapchain_extent)?;
 
         let app = VulkanApp {
             window,
@@ -185,6 +187,7 @@ impl VulkanApp {
             swapchain_image_views,
             render_pass,
             pipeline_layout,
+            pipeline,
         };
         Ok(app)
     }
@@ -289,50 +292,51 @@ impl VulkanApp {
 
     fn create_graphics_pipeline(
         device: &ash::Device,
+        render_pass: vk::RenderPass,
         swapchain_extent: vk::Extent2D,
-    ) -> Result<vk::PipelineLayout> {
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
         let vert_shader_module = Self::create_shader_module(device, "shaders/vert.spv")?;
-        let frag_shader_module = Self::create_shader_module(device, "shaders/vert.spv")?;
+        let frag_shader_module = Self::create_shader_module(device, "shaders/frag.spv")?;
 
-        let shader_stages = (
-            vk::PipelineShaderStageCreateInfo::builder()
+        let shader_stages = [
+            *vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .module(vert_shader_module)
                 .name(&SHADER_ENTRYPOINT),
-            vk::PipelineShaderStageCreateInfo::builder()
+            *vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag_shader_module)
                 .name(&SHADER_ENTRYPOINT),
-        );
+        ];
 
         let vertex_input_state_create_info = vk::PipelineVertexInputStateCreateInfo::builder()
             .vertex_binding_descriptions(&[])
             .vertex_attribute_descriptions(&[]);
 
-        let input_assembly__state_create_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        let input_assembly_state_create_info = vk::PipelineInputAssemblyStateCreateInfo::builder()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .primitive_restart_enable(false);
 
-        let viewport = vk::Viewport {
+        let viewport = [vk::Viewport {
             x: 0.0,
             y: 0.0,
             width: swapchain_extent.width as f32,
             height: swapchain_extent.height as f32,
             min_depth: 0.0,
             max_depth: 1.0,
-        };
+        }];
 
-        let scissor = vk::Rect2D {
+        let scissor = [vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: swapchain_extent,
-        };
+        }];
 
         let viewport_state_create_info = vk::PipelineViewportStateCreateInfo::builder()
-            .viewports(&[viewport])
-            .scissors(&[scissor]);
+            .viewports(&viewport)
+            .scissors(&scissor);
 
         let rasterization_state_create_info = vk::PipelineRasterizationStateCreateInfo::builder()
-            .depth_clamp_enable(true)
+            .depth_clamp_enable(false)
             .rasterizer_discard_enable(false)
             .polygon_mode(vk::PolygonMode::FILL)
             .line_width(1.0)
@@ -344,13 +348,13 @@ impl VulkanApp {
             .depth_bias_slope_factor(0.0);
 
         let multisampling_state_create_info = vk::PipelineMultisampleStateCreateInfo::builder()
-            .sample_shading_enable(true)
+            .sample_shading_enable(false)
             .rasterization_samples(vk::SampleCountFlags::TYPE_1)
             .min_sample_shading(1.0)
             .alpha_to_coverage_enable(false)
             .alpha_to_one_enable(false);
 
-        let color_blend_attachment_state = vk::PipelineColorBlendAttachmentState::builder()
+        let color_blend_attachment_state = [*vk::PipelineColorBlendAttachmentState::builder()
             .color_write_mask(
                 vk::ColorComponentFlags::R
                     | vk::ColorComponentFlags::G
@@ -363,12 +367,12 @@ impl VulkanApp {
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
             .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-            .alpha_blend_op(vk::BlendOp::ADD);
+            .alpha_blend_op(vk::BlendOp::ADD)];
 
         let color_blend_state_create_info = vk::PipelineColorBlendStateCreateInfo::builder()
             .logic_op_enable(false)
             .logic_op(vk::LogicOp::COPY)
-            .attachments(&[*color_blend_attachment_state]);
+            .attachments(&color_blend_attachment_state);
 
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::LINE_WIDTH];
 
@@ -382,12 +386,36 @@ impl VulkanApp {
         let pipeline_layout =
             unsafe { device.create_pipeline_layout(&pipeline_layout_create_info, None)? };
 
+        let pipeline_create_info = [*vk::GraphicsPipelineCreateInfo::builder()
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input_state_create_info)
+            .input_assembly_state(&input_assembly_state_create_info)
+            .viewport_state(&viewport_state_create_info)
+            .rasterization_state(&rasterization_state_create_info)
+            .multisample_state(&multisampling_state_create_info)
+            .color_blend_state(&color_blend_state_create_info)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0)
+            .base_pipeline_handle(vk::Pipeline::null())
+            .base_pipeline_index(-1)];
+
+        let graphics_pipelines = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_create_info, None)
+                .map_err(|(_, e)| e)?
+        };
+
         unsafe {
             device.destroy_shader_module(vert_shader_module, None);
             device.destroy_shader_module(frag_shader_module, None);
         };
 
-        Ok(pipeline_layout)
+        if graphics_pipelines.len() != 1 {
+            anyhow::bail!("failed to create exactly 1 graphics pipeline.",)
+        }
+
+        Ok((pipeline_layout, graphics_pipelines[0]))
     }
 
     fn create_shader_module(device: &ash::Device, path: &str) -> Result<vk::ShaderModule> {
@@ -852,6 +880,8 @@ impl Drop for VulkanApp {
             for image_view in self.swapchain_image_views.iter() {
                 self.logical_device.destroy_image_view(*image_view, None);
             }
+
+            self.logical_device.destroy_pipeline(self.pipeline, None);
 
             self.logical_device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
