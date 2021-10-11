@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use lazy_static::{__Deref, lazy_static};
+use lazy_static::lazy_static;
 use libc::c_char;
 use std::{
     borrow::Cow,
@@ -48,6 +48,7 @@ struct VulkanApp {
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    command_pool: vk::CommandPool,
 }
 
 lazy_static! {
@@ -174,6 +175,17 @@ impl VulkanApp {
             swapchain_extent,
         )?;
 
+        let command_pool = Self::create_command_pool(&logical_device, &queue_family_indices)?;
+
+        Self::create_command_buffer(
+            &logical_device,
+            &command_pool,
+            render_pass,
+            &framebuffers,
+            swapchain_extent,
+            pipeline,
+        )?;
+
         let app = VulkanApp {
             window,
             event_loop: Some(event_loop),
@@ -197,6 +209,7 @@ impl VulkanApp {
             render_pass,
             pipeline_layout,
             pipeline,
+            command_pool,
         };
         Ok(app)
     }
@@ -265,6 +278,66 @@ impl VulkanApp {
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
 
         Ok((entry, instance))
+    }
+
+    fn create_command_pool(
+        device: &ash::Device,
+        indices: &QueueFamilyIndices,
+    ) -> Result<vk::CommandPool> {
+        let create_info = vk::CommandPoolCreateInfo::builder()
+            .queue_family_index(indices.graphics_family.unwrap())
+            .flags(vk::CommandPoolCreateFlags::empty());
+
+        let command_pool = unsafe { device.create_command_pool(&create_info, None)? };
+        Ok(command_pool)
+    }
+
+    fn create_command_buffer(
+        device: &ash::Device,
+        command_pool: &vk::CommandPool,
+        render_pass: vk::RenderPass,
+        framebuffers: &Vec<vk::Framebuffer>,
+        swapchain_extent: vk::Extent2D,
+        graphics_pipeline: vk::Pipeline,
+    ) -> Result<()> {
+        let alloc_info = vk::CommandBufferAllocateInfo::builder()
+            .command_pool(*command_pool)
+            .command_buffer_count(framebuffers.len() as u32)
+            .level(vk::CommandBufferLevel::PRIMARY);
+
+        let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info)? };
+
+        for (i, &command) in command_buffers.iter().enumerate() {
+            let begin_info = vk::CommandBufferBeginInfo::builder();
+
+            unsafe {
+                device.begin_command_buffer(command, &begin_info)?;
+            }
+
+            let render_pass_info = vk::RenderPassBeginInfo::builder()
+                .render_pass(render_pass)
+                .framebuffer(framebuffers[i])
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: swapchain_extent,
+                })
+                .clear_values(&[vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                }]
+            );
+
+            unsafe {
+                device.cmd_begin_render_pass(command, &render_pass_info, vk::SubpassContents::INLINE);
+                device.cmd_bind_pipeline(command, vk::PipelineBindPoint::GRAPHICS, graphics_pipeline);
+                device.cmd_draw(command, 3, 1, 0, 0);
+                device.cmd_end_render_pass(command);
+                device.end_command_buffer(command)?;
+            }
+
+        }
+        Ok(())
     }
 
     fn create_render_pass(
@@ -407,7 +480,7 @@ impl VulkanApp {
 
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::LINE_WIDTH];
 
-        let dynamic_state_create_info =
+        let _dynamic_state_create_info =
             vk::PipelineDynamicStateCreateInfo::builder().dynamic_states(&dynamic_states);
 
         let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::builder()
@@ -917,6 +990,9 @@ impl Drop for VulkanApp {
             }
 
             self.logical_device.destroy_pipeline(self.pipeline, None);
+
+            self.logical_device
+                .destroy_command_pool(self.command_pool, None);
 
             self.logical_device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
