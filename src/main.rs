@@ -44,6 +44,7 @@ struct VulkanApp {
     swapchain_format: vk::Format,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+    render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
 }
 
@@ -160,6 +161,7 @@ impl VulkanApp {
         let swapchain_image_views =
             Self::create_image_views(&logical_device, &swapchain_images, swapchain_format)?;
 
+        let render_pass = Self::create_render_pass(&logical_device, swapchain_format)?;
         let pipeline_layout = Self::create_graphics_pipeline(&logical_device, swapchain_extent)?;
 
         let app = VulkanApp {
@@ -181,6 +183,7 @@ impl VulkanApp {
             swapchain_extent,
             swapchain_format,
             swapchain_image_views,
+            render_pass,
             pipeline_layout,
         };
         Ok(app)
@@ -250,6 +253,38 @@ impl VulkanApp {
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
 
         Ok((entry, instance))
+    }
+
+    fn create_render_pass(
+        device: &ash::Device,
+        swapchain_format: vk::Format,
+    ) -> Result<vk::RenderPass> {
+        let color_attachment_descriptions = [*vk::AttachmentDescription::builder()
+            .format(swapchain_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+
+        let attachment_refs = [vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        }];
+
+        let subpass = [*vk::SubpassDescription::builder()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&attachment_refs)];
+
+        let create_info = vk::RenderPassCreateInfo::builder()
+            .attachments(&color_attachment_descriptions)
+            .subpasses(&subpass);
+
+        let render_pass = unsafe { device.create_render_pass(&create_info, None)? };
+
+        Ok(render_pass)
     }
 
     fn create_graphics_pipeline(
@@ -820,6 +855,8 @@ impl Drop for VulkanApp {
 
             self.logical_device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.logical_device
+                .destroy_render_pass(self.render_pass, None);
 
             self.logical_device.destroy_device(None);
 
