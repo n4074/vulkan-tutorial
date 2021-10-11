@@ -44,6 +44,7 @@ struct VulkanApp {
     swapchain_format: vk::Format,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
@@ -166,6 +167,13 @@ impl VulkanApp {
         let (pipeline_layout, pipeline) =
             Self::create_graphics_pipeline(&logical_device, render_pass, swapchain_extent)?;
 
+        let framebuffers = Self::create_frame_buffers(
+            &logical_device,
+            &swapchain_image_views,
+            &render_pass,
+            swapchain_extent,
+        )?;
+
         let app = VulkanApp {
             window,
             event_loop: Some(event_loop),
@@ -185,6 +193,7 @@ impl VulkanApp {
             swapchain_extent,
             swapchain_format,
             swapchain_image_views,
+            framebuffers,
             render_pass,
             pipeline_layout,
             pipeline,
@@ -288,6 +297,28 @@ impl VulkanApp {
         let render_pass = unsafe { device.create_render_pass(&create_info, None)? };
 
         Ok(render_pass)
+    }
+
+    fn create_frame_buffers(
+        device: &ash::Device,
+        image_views: &Vec<vk::ImageView>,
+        render_pass: &vk::RenderPass,
+        extents: vk::Extent2D,
+    ) -> Result<Vec<vk::Framebuffer>> {
+        let mut framebuffers = vec![];
+        for &view in image_views {
+            let views = &[view];
+            let create_info = vk::FramebufferCreateInfo::builder()
+                .render_pass(*render_pass)
+                .attachments(views)
+                .width(extents.width)
+                .height(extents.height)
+                .layers(1);
+
+            let framebuffer = unsafe { device.create_framebuffer(&create_info, None) }?;
+            framebuffers.push(framebuffer);
+        }
+        Ok(framebuffers)
     }
 
     fn create_graphics_pipeline(
@@ -875,6 +906,10 @@ impl Drop for VulkanApp {
                 (self.debug_utils_loader.take(), self.debug_callback.take())
             {
                 debug_utils_loader.destroy_debug_utils_messenger(debug_callback, None)
+            }
+
+            for framebuffer in self.framebuffers.iter() {
+                self.logical_device.destroy_framebuffer(*framebuffer, None)
             }
 
             for image_view in self.swapchain_image_views.iter() {
