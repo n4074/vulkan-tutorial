@@ -16,13 +16,11 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-use ash::vk::{self, DebugUtilsMessengerCreateInfoEXTBuilder};
-use ash::{
-    extensions::{
-        ext::DebugUtils,
-        khr::{Surface, Swapchain},
-    },
+use ash::extensions::{
+    ext::DebugUtils,
+    khr::{Surface, Swapchain},
 };
+use ash::vk::{self, DebugUtilsMessengerCreateInfoEXTBuilder};
 //use ash::vk::{ApplicationInfo, StructureType};
 
 #[allow(dead_code)]
@@ -55,6 +53,8 @@ lazy_static! {
     static ref ENGINE_NAME: CString = CString::new("No engine".as_bytes()).unwrap();
     static ref DEVICE_EXTENSIONS: [&'static CStr; 1] =
         [CStr::from_bytes_with_nul("VK_KHR_swapchain\0".as_bytes()).unwrap()];
+    static ref SHADER_ENTRYPOINT: &'static CStr =
+        CStr::from_bytes_with_nul("main\0".as_bytes()).unwrap();
 }
 
 //#[derive(Default)]
@@ -143,19 +143,23 @@ impl VulkanApp {
             &queue_family_indices,
         )?;
 
-        let (swapchain, swapchain_loader, swapchain_format, swapchain_extent) = Self::create_swapchain(
-            &instance,
-            &logical_device,
-            physical_device,
-            surface,
-            &surface_loader,
-            &window,
-            &queue_family_indices,
-        )?;
+        let (swapchain, swapchain_loader, swapchain_format, swapchain_extent) =
+            Self::create_swapchain(
+                &instance,
+                &logical_device,
+                physical_device,
+                surface,
+                &surface_loader,
+                &window,
+                &queue_family_indices,
+            )?;
 
         let swapchain_images = unsafe { swapchain_loader.get_swapchain_images(swapchain)? };
 
-        let swapchain_image_views = Self::create_image_views(&logical_device, &swapchain_images, swapchain_format)?;
+        let swapchain_image_views =
+            Self::create_image_views(&logical_device, &swapchain_images, swapchain_format)?;
+
+        Self::create_graphics_pipeline(&logical_device)?;
 
         let app = VulkanApp {
             window,
@@ -190,9 +194,11 @@ impl VulkanApp {
                     Event::WindowEvent {
                         event: WindowEvent::CloseRequested,
                         window_id,
-                    } => if window_id == id {
-                        *control_flow = ControlFlow::Exit
-                    },
+                    } => {
+                        if window_id == id {
+                            *control_flow = ControlFlow::Exit
+                        }
+                    }
                     _ => (),
                 }
             });
@@ -242,6 +248,44 @@ impl VulkanApp {
         let instance = unsafe { entry.create_instance(&instance_info, None)? };
 
         Ok((entry, instance))
+    }
+
+    fn create_graphics_pipeline(device: &ash::Device) -> Result<()> {
+        let vert_shader_module = Self::create_shader_module(device, "shaders/vert.spv")?;
+        let frag_shader_module = Self::create_shader_module(device, "shaders/vert.spv")?;
+
+        let shader_staged = (
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert_shader_module)
+                .name(&SHADER_ENTRYPOINT),
+            vk::PipelineShaderStageCreateInfo::builder()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag_shader_module)
+                .name(&SHADER_ENTRYPOINT),
+        );
+
+        unsafe {
+            device.destroy_shader_module(vert_shader_module, None);
+            device.destroy_shader_module(frag_shader_module, None);
+        };
+        Ok(())
+    }
+
+    fn create_shader_module(device: &ash::Device, path: &str) -> Result<vk::ShaderModule> {
+        let bitcode_bytes = std::fs::read(path)?;
+        let bitcode = bitcode_bytes
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .collect::<Vec<u32>>();
+
+        let create_info = vk::ShaderModuleCreateInfo::builder().code(&bitcode);
+
+        unsafe {
+            device
+                .create_shader_module(&create_info, None)
+                .context("could not create shader module")
+        }
     }
 
     fn create_swapchain(
@@ -301,25 +345,29 @@ impl VulkanApp {
         Ok((swapchain, swapchain_loader, surface_format.format, extent))
     }
 
-    fn create_image_views(device: &ash::Device, images: &Vec<vk::Image>, format: vk::Format) -> Result<Vec<vk::ImageView>> {
+    fn create_image_views(
+        device: &ash::Device,
+        images: &Vec<vk::Image>,
+        format: vk::Format,
+    ) -> Result<Vec<vk::ImageView>> {
         let mut image_views = vec![];
         for image in images.iter() {
             let create_info = vk::ImageViewCreateInfo::builder()
                 .image(*image)
                 .format(format)
                 .view_type(vk::ImageViewType::TYPE_2D)
-                .components(vk::ComponentMapping { 
+                .components(vk::ComponentMapping {
                     r: vk::ComponentSwizzle::IDENTITY,
                     g: vk::ComponentSwizzle::IDENTITY,
                     b: vk::ComponentSwizzle::IDENTITY,
-                    a: vk::ComponentSwizzle::IDENTITY 
+                    a: vk::ComponentSwizzle::IDENTITY,
                 })
                 .subresource_range(vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     base_mip_level: 0,
                     level_count: 1,
                     base_array_layer: 0,
-                    layer_count: 1
+                    layer_count: 1,
                 });
 
             let view = unsafe { device.create_image_view(&create_info, None)? };
